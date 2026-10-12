@@ -1,5 +1,5 @@
 'use strict';
-const CACHE = 'biyada-45ae81ae7832';
+const CACHE = 'biyada-2c54948686dd';
 const FILES = ["./","app.js","icon.svg","icons/icon-192.png","icons/icon-512.png","index.html","local-backend.js","manifest.webmanifest","sql-wasm.js","sql-wasm.wasm","styles.css","xlsx.js"];
 self.addEventListener('install', (e) => {
   e.waitUntil(caches.open(CACHE).then((c) => c.addAll(FILES)).then(() => self.skipWaiting()));

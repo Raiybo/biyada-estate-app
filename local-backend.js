@@ -184,8 +184,8 @@
       var DEFAULT_ACCOUNTS = [
         ["1010", "Cash on Hand", "asset", { cash: 1 }],
         ["1020", "Bank Account", "asset", { cash: 1 }],
-        ["1100", "Receivables from Unit Buyers", "asset"],
-        ["1200", "Advances to Contractors", "asset"],
+        ["1100", "Receivables from Unit Buyers", "asset", { partner: 1 }],
+        ["1200", "Advances to Contractors", "asset", { partner: 1 }],
         ["1300", "Land", "asset", { cost: 1 }],
         ["1310", "Land Registration & Transfer Fees", "asset", { cost: 1 }],
         ["1400", "Design & Engineering", "asset", { cost: 1 }],
@@ -202,10 +202,10 @@
         ["1480", "Fences, Gates & Security", "asset", { cost: 1 }],
         ["1490", "Site Supervision & Project Management", "asset", { cost: 1 }],
         ["1500", "Equipment & Vehicles", "asset", { cost: 1 }],
-        ["2000", "Accounts Payable (Suppliers)", "liability"],
-        ["2100", "Retention Payable (Contractors)", "liability"],
-        ["2200", "Buyer Deposits & Advances", "liability"],
-        ["2300", "Loans Payable", "liability"],
+        ["2000", "Accounts Payable (Suppliers)", "liability", { partner: 1 }],
+        ["2100", "Retention Payable (Contractors)", "liability", { partner: 1 }],
+        ["2200", "Buyer Deposits & Advances", "liability", { partner: 1 }],
+        ["2300", "Loans Payable", "liability", { partner: 1 }],
         ["2400", "Accrued Expenses", "liability"],
         ["2500", "Taxes Payable", "liability"],
         ["3900", "Retained Earnings", "equity"],
@@ -232,10 +232,10 @@
       var DEBIT_NATURE = /* @__PURE__ */ new Set(["asset", "expense"]);
       function seedAccounts(db, projectId) {
         const ins = db.prepare(
-          "INSERT INTO accounts (project_id, code, name, type, is_cash, is_cost) VALUES (?, ?, ?, ?, ?, ?)"
+          "INSERT INTO accounts (project_id, code, name, type, is_cash, is_cost, is_partner) VALUES (?, ?, ?, ?, ?, ?, ?)"
         );
         for (const [code, name, type, flags = {}] of DEFAULT_ACCOUNTS) {
-          ins.run(projectId, code, name, type, flags.cash || 0, flags.cost || 0);
+          ins.run(projectId, code, name, type, flags.cash || 0, flags.cost || 0, flags.partner || 0);
         }
       }
       function nextCapitalCode(db, projectId) {
@@ -514,6 +514,62 @@
           upcoming
         };
       }
+      function statementOfAccount(db, projectId, { contactId, ownerId, from, to } = {}) {
+        let party;
+        let rows = [];
+        if (ownerId) {
+          party = db.prepare("SELECT * FROM owners WHERE id = ? AND project_id = ?").get(ownerId, projectId);
+          if (!party) return null;
+          party = { kind: "owner", name: party.name, phone: party.phone, email: party.email, account_id: party.capital_account_id };
+          rows = db.prepare(
+            `SELECT v.id AS voucher_id, v.type, v.number, v.date, v.description, v.reference, a.name AS account, l.debit, l.credit, l.memo
+       FROM voucher_lines l JOIN vouchers v ON v.id = l.voucher_id JOIN accounts a ON a.id = l.account_id
+       WHERE l.account_id = ? AND ${POSTED} ORDER BY v.date, v.id, l.line_no`
+          ).all(party.account_id);
+        } else {
+          const c = db.prepare("SELECT * FROM contacts WHERE id = ? AND project_id = ?").get(contactId, projectId);
+          if (!c) return null;
+          party = { kind: "contact", name: c.name, type: c.kind, phone: c.phone, email: c.email, tax_id: c.tax_id, address: c.address };
+          const vouchers = db.prepare(`SELECT * FROM vouchers v WHERE v.contact_id = ? AND ${POSTED} ORDER BY v.date, v.id`).all(c.id);
+          const linesQ = db.prepare(
+            `SELECT l.*, a.name AS account, a.is_cash, a.is_partner FROM voucher_lines l
+       JOIN accounts a ON a.id = l.account_id WHERE l.voucher_id = ? ORDER BY l.line_no`
+          );
+          for (const v of vouchers) {
+            const lines = linesQ.all(v.id);
+            const base = { voucher_id: v.id, type: v.type, number: v.number, date: v.date, description: v.description, reference: v.reference };
+            const partner = lines.filter((l) => l.is_partner);
+            if (partner.length) {
+              for (const l of partner) rows.push({ ...base, account: l.account, memo: l.memo, debit: l.debit, credit: l.credit });
+              continue;
+            }
+            const paid = lines.filter((l) => l.is_cash).reduce((t, l) => t + l.credit - l.debit, 0);
+            if (paid > 0) {
+              rows.push({ ...base, account: "Invoice / purchase", debit: 0, credit: paid });
+              rows.push({ ...base, account: "Paid to them", debit: paid, credit: 0 });
+            } else if (paid < 0) {
+              rows.push({ ...base, account: "Sale / charge", debit: -paid, credit: 0 });
+              rows.push({ ...base, account: "Received from them", debit: 0, credit: -paid });
+            }
+          }
+        }
+        let opening = 0;
+        if (from) {
+          for (const r of rows.filter((x) => x.date < from)) opening += r.debit - r.credit;
+          rows = rows.filter((x) => x.date >= from);
+        }
+        if (to) rows = rows.filter((x) => x.date <= to);
+        let balance = opening;
+        let debit = 0;
+        let credit = 0;
+        for (const r of rows) {
+          balance += r.debit - r.credit;
+          r.balance = balance;
+          debit += r.debit;
+          credit += r.credit;
+        }
+        return { party, opening, rows, debit, credit, closing: balance };
+      }
       module.exports = {
         VOUCHER_TYPES,
         seedAccounts,
@@ -527,7 +583,8 @@
         ledger,
         ownerStatement,
         budgetVsActual,
-        dashboard
+        dashboard,
+        statementOfAccount
       };
     }
   });
@@ -1154,6 +1211,7 @@
           description: "str",
           is_cash: "bool",
           is_cost: "bool",
+          is_partner: "bool",
           active: "bool"
         }
       };
@@ -1169,7 +1227,8 @@
         start_date: "date",
         target_completion: "date",
         total_budget: "money",
-        archived: "bool"
+        archived: "bool",
+        lbp_rate: "num"
       };
       var LIST_ORDER = {
         owners: "id",
@@ -1609,6 +1668,7 @@
         route("POST", "/api/projects", "admin", (ctx) => {
           const data = cleanFields(db, null, PROJECT_FIELDS, ctx.body, false);
           data.currency = (data.currency || "USD").toUpperCase().slice(0, 3);
+          if (!(data.lbp_rate > 0)) delete data.lbp_rate;
           const id = db.transaction(() => {
             const pid = insert("projects", data);
             acc.seedAccounts(db, pid);
@@ -1622,6 +1682,7 @@
           const p = project(ctx.params.pid);
           const data = cleanFields(db, p.id, PROJECT_FIELDS, ctx.body, true);
           if (data.currency) data.currency = data.currency.toUpperCase().slice(0, 3);
+          if ("lbp_rate" in data && !(data.lbp_rate > 0)) delete data.lbp_rate;
           if ("lock_date" in ctx.body) {
             const v = ctx.body.lock_date || null;
             if (v && !/^\d{4}-\d{2}-\d{2}$/.test(v)) throw new HttpError(400, "Lock date must be YYYY-MM-DD.");
@@ -2010,6 +2071,16 @@
               return acc.ownerStatement(db, p.id, { to });
             case "budget":
               return acc.budgetVsActual(db, p.id);
+            case "soa": {
+              const soa = acc.statementOfAccount(db, p.id, {
+                contactId: Number(ctx.query.contact_id) || null,
+                ownerId: Number(ctx.query.owner_id) || null,
+                from,
+                to
+              });
+              if (!soa) throw new HttpError(404, "Choose a supplier, buyer or owner.");
+              return { ...soa, currency: p.currency, lbp_rate: p.lbp_rate };
+            }
             case "ledger": {
               const l = acc.ledger(db, p.id, Number(account_id), { from, to });
               if (!l) throw new HttpError(404, "Account not found.");
@@ -2362,6 +2433,13 @@
     created_at TEXT NOT NULL DEFAULT (datetime('now')),
     revoked_at TEXT
   );
+  `,
+        `
+  ALTER TABLE projects ADD COLUMN lbp_rate REAL NOT NULL DEFAULT 89500;
+  `,
+        `
+  ALTER TABLE accounts ADD COLUMN is_partner INTEGER NOT NULL DEFAULT 0;
+  UPDATE accounts SET is_partner = 1 WHERE code IN ('1100', '1200', '2000', '2100', '2200', '2300');
   `
       ];
       function migrate2(db) {

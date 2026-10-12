@@ -413,6 +413,7 @@ const NAV = [
   ['vouchers', '☰', 'Journal Vouchers'],
   ['accounts', '#', 'Chart of Accounts'],
   ['reports', '▤', 'Financial Reports'],
+  ['soa', '⇄', 'Statement of Account'],
   ['budget', '◔', 'Budget'],
   ['Compound'],
   ['owners', '◉', 'Owners & Shares'],
@@ -614,6 +615,7 @@ const PROJECT_FIELDS = [
   { k: 'currency', l: 'Currency', def: 'USD', hint: '3-letter code: USD, EUR, LBP, AED…' },
   { k: 'status', t: 'select', opts: enumOpts('projectStatus'), def: 'planning', req: 1 },
   { k: 'total_budget', l: 'Total budget', t: 'money' },
+  { k: 'lbp_rate', l: 'LBP exchange rate (LBP per $1)', t: 'number', step: 'any', def: 89500, hint: 'Used to show amounts in both $ and LBP' },
   { k: 'start_date', l: 'Start date', t: 'date' },
   { k: 'target_completion', l: 'Target completion', t: 'date' },
   { k: 'description', t: 'textarea' },
@@ -1015,6 +1017,7 @@ ROUTES['voucher-edit'] = async (t, id) => {
     <div class="table-wrap"><table class="lines-table"><thead><tr><th>Account</th><th class="num">Debit</th><th class="num">Credit</th><th>Memo</th><th>Owner</th><th>Building</th><th></th></tr></thead>
       <tbody id="lineRows"></tbody>
       <tfoot><tr><td><button type="button" class="btn secondary small" id="addLine">＋ Add line</button></td><td class="num" id="totD"></td><td class="num" id="totC"></td><td colspan="4" id="diff"></td></tr></tfoot></table></div>
+    <p class="hint">Each new line is filled with the amount still needed to balance, on the opposite side. Change it if you need to (e.g. to add a tax line) — the next line picks up whatever is left. Press Enter to go to a new line.</p>
     <h3 style="margin-top:18px">Receipts & attachments</h3>${dropzoneHtml()}
     <div id="jvErr" class="error" hidden></div>
     <div style="display:flex;gap:10px;justify-content:flex-end;margin-top:16px">
@@ -1068,12 +1071,41 @@ ROUTES['voucher-edit'] = async (t, id) => {
     lines.splice(Number(e.target.closest('tr').dataset.i), 1);
     drawLines();
   });
-  $('#addLine').addEventListener('click', () => {
+  // Standard (Odoo-style) balancing: an empty line is filled with whatever is still needed to
+  // balance, on the opposite side. Only once per line, so the user can overwrite or clear it.
+  const remaining = () => {
     const d = lines.reduce((s, l) => s + (l.debit || 0), 0);
     const c = lines.reduce((s, l) => s + (l.credit || 0), 0);
-    lines.push(d > c ? { credit: d - c } : c > d ? { debit: c - d } : {});
+    return d > c ? { credit: d - c } : c > d ? { debit: c - d } : {};
+  };
+  const prefill = (tr) => {
+    const l = lines[Number(tr.dataset.i)];
+    if (!l || l.prefilled || l.debit || l.credit) return;
+    const r = remaining();
+    if (!r.debit && !r.credit) return;
+    Object.assign(l, r, { prefilled: true });
+    $('input[name=debit]', tr).value = centsInput(l.debit);
+    $('input[name=credit]', tr).value = centsInput(l.credit);
+    totals();
+  };
+  const addLine = () => {
+    lines.push({ ...remaining(), prefilled: true });
     drawLines();
+    $('#lineRows tr:last-child select[name=account_id]').focus();
+  };
+  $('#lineRows').addEventListener('focusin', (e) => {
+    prefill(e.target.closest('tr'));
+    // Select the amount so typing replaces it instead of adding to it.
+    if (e.target.name === 'debit' || e.target.name === 'credit') e.target.select();
   });
+  $('#lineRows').addEventListener('keydown', (e) => {
+    if (e.key !== 'Enter' || e.target.tagName !== 'INPUT') return;
+    e.preventDefault(); // Enter moves to the next line instead of submitting the voucher
+    const next = e.target.closest('tr').nextElementSibling;
+    if (next) $('select[name=account_id]', next).focus();
+    else addLine();
+  });
+  $('#addLine').addEventListener('click', addLine);
   drawLines();
 
   $('#jvForm').addEventListener('submit', async (e) => {
@@ -1114,6 +1146,7 @@ const ACCOUNT_FIELDS = [
   { k: 'description', t: 'textarea' },
   { k: 'is_cash', l: 'This is a cash / bank account', t: 'check' },
   { k: 'is_cost', l: 'Counts toward total project cost', t: 'check' },
+  { k: 'is_partner', l: 'Holds balances with suppliers/buyers (payable, receivable, deposit, loan) — shown on their Statement of Account', t: 'check' },
   { k: 'active', l: 'Active', t: 'check', def: 1 },
 ];
 ROUTES.accounts = async (t) => {
@@ -1222,6 +1255,7 @@ ROUTES.owners = async (t) => {
         <div class="row"><span>Remaining commitment</span><span>${money(o.remaining_commitment)}</span></div>
         ${o.committed_capital ? progress(o.contributed, o.committed_capital) : ''}
         ${o.phone || o.email ? `<div class="muted small" style="margin-top:8px">${esc([o.phone, o.email].filter(Boolean).join(' · '))}</div>` : ''}
+        <a class="small" href="#/soa/o-${o.id}">Statement of account →</a>
         <details style="margin-top:8px"><summary class="small">Contribution history (${o.history.length})</summary>
           ${o.history.length ? o.history.map((h) => `<div class="row small"><span><a href="#/voucher/${h.voucher_id}">${vno(h)}</a> · ${esc(h.date)}</span>${signed(h.credit - h.debit)}</div>`).join('') : '<div class="muted small">None yet.</div>'}
         </details>
@@ -1314,6 +1348,7 @@ ROUTES.contacts = simplePage({
     { h: 'Paid to them', cls: 'num', v: (r) => (r.net_paid > 0 ? money(r.net_paid) : ''), csv: (r) => (Math.max(0, r.net_paid) / 100).toFixed(2) },
     { h: 'Received from them', cls: 'num', v: (r) => (r.net_paid < 0 ? money(-r.net_paid) : ''), csv: (r) => (Math.max(0, -r.net_paid) / 100).toFixed(2) },
     { h: 'We owe / hold', cls: 'num', v: (r) => (r.owed ? money(r.owed) : ''), csv: (r) => (r.owed / 100).toFixed(2) },
+    { h: '', v: (r) => `<a class="btn ghost small" href="#/soa/c-${r.id}">Statement</a>`, csv: () => '' },
   ],
 });
 
@@ -1566,6 +1601,111 @@ ROUTES.audit = async (t) => {
     <div class="card">${table(cols, rows, { empty: 'No activity yet.' })}</div>`;
   if (!view(t, 'Activity log', '<button class="btn secondary" id="csv">Export CSV</button>', html)) return;
   $('#csv').addEventListener('click', () => exportCsv('activity-log', cols, rows));
+};
+
+/* ---------------- statement of account ---------------- */
+const usdFmt = (cents) => new Intl.NumberFormat(undefined, { style: 'currency', currency: 'USD', minimumFractionDigits: 2 }).format(cents / 100);
+const lbpFmt = (cents) => `LBP ${Math.round(cents / 100).toLocaleString()}`;
+// Amounts are stored in the project's currency; show them in both $ and LBP using the project's rate.
+function dualCurrency(currency, rate) {
+  const isLbp = currency === 'LBP';
+  return {
+    usd: (c) => (isLbp ? Math.round(c / rate) : c),
+    lbp: (c) => (isLbp ? c : Math.round(c * rate)),
+  };
+}
+const drCr = (bal, fmt) => (bal === 0 ? fmt(0) : `${fmt(Math.abs(bal))} ${bal > 0 ? 'Dr' : 'Cr'}`);
+
+ROUTES.soa = async (t, arg) => {
+  const f = S.soaFilter || {};
+  if (arg) { f.party = arg; S.soaFilter = f; }
+  const show = f.show || 'both';
+  const L = S.lists;
+  const parties = `<option value="">Choose who…</option>
+    <optgroup label="Suppliers, contractors & buyers">${L.contacts.map((c) => `<option value="c-${c.id}"${f.party === `c-${c.id}` ? ' selected' : ''}>${esc(c.name)} (${esc(human(c.kind))})</option>`).join('')}</optgroup>
+    <optgroup label="Owners">${L.owners.map((o) => `<option value="o-${o.id}"${f.party === `o-${o.id}` ? ' selected' : ''}>${esc(o.name)}</option>`).join('')}</optgroup>`;
+  const filters = `<div class="filters no-print">
+      <select id="soaParty" style="min-width:240px">${parties}</select>
+      <label class="small muted">From <input type="date" id="soaFrom" value="${esc(f.from || '')}"></label>
+      <label class="small muted">To <input type="date" id="soaTo" value="${esc(f.to || '')}"></label>
+      <select id="soaShow"><option value="both"${show === 'both' ? ' selected' : ''}>$ and LBP</option><option value="usd"${show === 'usd' ? ' selected' : ''}>$ only</option><option value="lbp"${show === 'lbp' ? ' selected' : ''}>LBP only</option></select>
+    </div>`;
+  let body = '<div class="card empty">Choose a supplier, buyer or owner to see their statement of account.</div>';
+  let soa = null;
+  let cols = [];
+  if (f.party) {
+    const [kind, id] = f.party.split('-');
+    const qs = new URLSearchParams({ [kind === 'o' ? 'owner_id' : 'contact_id']: id, ...(f.from ? { from: f.from } : {}), ...(f.to ? { to: f.to } : {}) });
+    soa = await api('GET', P(`/reports/soa?${qs}`));
+    const cx = dualCurrency(soa.currency, soa.lbp_rate);
+    const usd = show !== 'lbp';
+    const lbp = show !== 'usd';
+    cols = [
+      { h: 'Date', v: (r) => `<span class="nowrap">${esc(r.date)}</span>` },
+      { h: 'Voucher', v: (r) => (r.voucher_id ? `<a class="mono nowrap" href="#/voucher/${r.voucher_id}">${vno(r)}</a>` : '') },
+      { h: 'Description', v: (r) => `${esc(r.description)}${r.account ? `<div class="muted small">${esc(r.account)}${r.reference ? ` · Ref ${esc(r.reference)}` : ''}</div>` : ''}` },
+      ...(usd ? [
+        { h: 'Debit $', cls: 'num', v: (r) => (r.debit ? usdFmt(cx.usd(r.debit)) : '') },
+        { h: 'Credit $', cls: 'num', v: (r) => (r.credit ? usdFmt(cx.usd(r.credit)) : '') },
+        { h: 'Balance $', cls: 'num', v: (r) => `<b>${drCr(cx.usd(r.balance), usdFmt)}</b>` },
+      ] : []),
+      ...(lbp ? [
+        { h: 'Debit LBP', cls: 'num', v: (r) => (r.debit ? lbpFmt(cx.lbp(r.debit)) : '') },
+        { h: 'Credit LBP', cls: 'num', v: (r) => (r.credit ? lbpFmt(cx.lbp(r.credit)) : '') },
+        { h: 'Balance LBP', cls: 'num', v: (r) => `<b>${drCr(cx.lbp(r.balance), lbpFmt)}</b>` },
+      ] : []),
+    ];
+    const opening = { date: f.from || '', description: 'Opening balance', debit: 0, credit: 0, balance: soa.opening };
+    const foot = ['', '', 'Totals / closing balance',
+      ...(usd ? [usdFmt(cx.usd(soa.debit)), usdFmt(cx.usd(soa.credit)), drCr(cx.usd(soa.closing), usdFmt)] : []),
+      ...(lbp ? [lbpFmt(cx.lbp(soa.debit)), lbpFmt(cx.lbp(soa.credit)), drCr(cx.lbp(soa.closing), lbpFmt)] : [])];
+    const owes = soa.closing > 0 ? `${esc(soa.party.name)} owes the project` : soa.closing < 0 ? `The project owes ${esc(soa.party.name)}` : 'Fully settled';
+    body = `<div class="card voucher-doc" style="max-width:none">
+      <div class="print-only" style="margin-bottom:12px"><h2>${esc(S.project.name)}</h2></div>
+      <div class="card-head"><div><h2>Statement of Account</h2><div class="muted">${esc(soa.party.name)}${soa.party.type ? ` · ${esc(human(soa.party.type))}` : soa.party.kind === 'owner' ? ' · Owner' : ''}</div></div>
+        <div class="small muted" style="text-align:right">${f.from || f.to ? `${esc(f.from || 'Start')} → ${esc(f.to || 'today')}` : 'All dates'}<br>Rate: ${Number(soa.lbp_rate).toLocaleString()} LBP = $1</div></div>
+      <div class="kpis">
+        <div class="kpi"><div class="label">Opening balance</div><div class="value" style="font-size:17px">${drCr(cx.usd(soa.opening), usdFmt)}</div><div class="sub">${drCr(cx.lbp(soa.opening), lbpFmt)}</div></div>
+        <div class="kpi"><div class="label">Total debit</div><div class="value" style="font-size:17px">${usdFmt(cx.usd(soa.debit))}</div><div class="sub">${lbpFmt(cx.lbp(soa.debit))}</div></div>
+        <div class="kpi"><div class="label">Total credit</div><div class="value" style="font-size:17px">${usdFmt(cx.usd(soa.credit))}</div><div class="sub">${lbpFmt(cx.lbp(soa.credit))}</div></div>
+        <div class="kpi"><div class="label">Closing balance</div><div class="value" style="font-size:17px">${drCr(cx.usd(soa.closing), usdFmt)}</div><div class="sub">${drCr(cx.lbp(soa.closing), lbpFmt)} · ${owes}</div></div>
+      </div>
+      ${table(cols, [opening, ...soa.rows], { foot })}
+      <p class="muted small" style="margin-top:10px">Balance = previous balance + debit − credit. <b>Dr</b> = they owe the project; <b>Cr</b> = the project owes them. Converted at ${Number(soa.lbp_rate).toLocaleString()} LBP per $1 (change it in Settings → Project details).</p>
+      <div class="signatures"><div>Prepared by</div><div>Checked by</div><div>Acknowledged by ${esc(soa.party.name)}</div></div>
+    </div>`;
+  }
+  const actions = soa ? '<button class="btn secondary" id="soaXlsx">Export to Excel</button><button class="btn secondary" id="soaPrint">Print / PDF</button>' : '';
+  if (!view(t, 'Statement of Account', actions, filters + body)) return;
+  const apply = () => {
+    S.soaFilter = { party: $('#soaParty').value, from: $('#soaFrom').value, to: $('#soaTo').value, show: $('#soaShow').value };
+    if (location.hash.startsWith('#/soa/')) history.replaceState(null, '', '#/soa');
+    router();
+  };
+  ['#soaParty', '#soaFrom', '#soaTo', '#soaShow'].forEach((sel) => $(sel).addEventListener('change', apply));
+  $('#soaPrint')?.addEventListener('click', () => window.print());
+  $('#soaXlsx')?.addEventListener('click', () => {
+    const cx = dualCurrency(soa.currency, soa.lbp_rate);
+    // Balance columns are live Excel formulas: previous balance + debit - credit.
+    const rows = [['', '', 'Opening balance', '', '', cx.usd(soa.opening), '', '', cx.lbp(soa.opening)]];
+    soa.rows.forEach((r, i) => {
+      const n = i + 3; // row 1 = header, row 2 = opening balance
+      rows.push([r.date, vno(r), `${r.description}${r.account ? ` (${r.account})` : ''}`,
+        cx.usd(r.debit), cx.usd(r.credit), { f: `F${n - 1}+D${n}-E${n}`, v: cx.usd(r.balance) },
+        cx.lbp(r.debit), cx.lbp(r.credit), { f: `I${n - 1}+G${n}-H${n}`, v: cx.lbp(r.balance) }]);
+    });
+    const last = soa.rows.length + 2;
+    rows.push(['', '', 'TOTAL', { f: `SUM(D3:D${last})`, v: cx.usd(soa.debit) }, { f: `SUM(E3:E${last})`, v: cx.usd(soa.credit) }, { f: `F${last}`, v: cx.usd(soa.closing) },
+      { f: `SUM(G3:G${last})`, v: cx.lbp(soa.debit) }, { f: `SUM(H3:H${last})`, v: cx.lbp(soa.credit) }, { f: `I${last}`, v: cx.lbp(soa.closing) }]);
+    const sheet = {
+      name: `SOA ${soa.party.name}`,
+      columns: [['Date', 'date'], ['Voucher'], ['Description'], ['Debit $', 'money'], ['Credit $', 'money'], ['Balance $ (+Dr / -Cr)', 'money'],
+        ['Debit LBP', 'money'], ['Credit LBP', 'money'], ['Balance LBP (+Dr / -Cr)', 'money']].map(([label, type = 'text']) => ({ label, type })),
+      rows,
+    };
+    downloadBlob(window.XlsxLite.build([sheet]), `SOA ${soa.party.name} ${today()}.xlsx`);
+    toast('Statement exported to Excel.');
+  });
 };
 
 /* ---------------- export & backup ---------------- */

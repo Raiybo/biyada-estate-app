@@ -1,6 +1,7 @@
 'use strict';
 // Tiny .xlsx writer (no dependencies). Sheets: [{ name, columns: [{ label, type }], rows: [[...]] }]
 // Column types: text, number, pct, date ('YYYY-MM-DD'), money (integer cents -> currency units).
+// A cell value can also be a formula: { f: 'F2+D3-E3', v: cachedValue }.
 (function () {
   const CRC = new Uint32Array(256).map((_, n) => {
     let c = n;
@@ -84,6 +85,11 @@
 
   function cell(ref, value, type) {
     if (value === null || value === undefined || value === '') return '';
+    // Formula cell: { f: 'F2+D3-E3', v: cachedValue }. Money formulas work in currency units like the cells they use.
+    if (typeof value === 'object' && 'f' in value) {
+      const v = typeof value.v === 'number' ? (type === 'money' ? value.v / 100 : value.v) : '';
+      return `<c r="${ref}"${type === 'money' ? ' s="2"' : ''}><f>${xml(value.f)}</f>${v === '' ? '' : `<v>${v}</v>`}</c>`;
+    }
     if (type === 'money' && typeof value === 'number') return `<c r="${ref}" s="2"><v>${value / 100}</v></c>`;
     if ((type === 'number' || type === 'pct') && typeof value === 'number' && Number.isFinite(value)) {
       return `<c r="${ref}" s="4"><v>${Math.round(value * 10000) / 10000}</v></c>`;
@@ -98,7 +104,7 @@
   function sheetXml(sheet) {
     const cols = sheet.columns;
     const widths = cols.map((c, i) => {
-      const longest = Math.max(c.label.length, ...sheet.rows.slice(0, 500).map((r) => String(r[i] ?? '').length));
+      const longest = Math.max(c.label.length, ...sheet.rows.slice(0, 500).map((r) => String(r[i] && typeof r[i] === 'object' ? r[i].v ?? '' : r[i] ?? '').length));
       return Math.min(60, Math.max(10, longest + 2));
     });
     const head = `<row r="1">${cols.map((c, i) => `<c r="${colName(i)}1" s="1" t="inlineStr"><is><t>${xml(c.label)}</t></is></c>`).join('')}</row>`;
